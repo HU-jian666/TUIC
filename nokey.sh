@@ -8,8 +8,6 @@ readonly URL_FILE="nokey.url"
 readonly DEFAULT_DOMAIN="www.bing.com"
 readonly GITHUB_URL="https://github.com/livingfree2023/nokey"
 readonly GITHUB_RELEASE_BASE_URL="https://github.com/livingfree2023/nokey/releases/latest/download"
-readonly GITHUB_SINGBOX_SERVICE_URL="https://raw.githubusercontent.com/livingfree2023/nokey/refs/heads/main/sing-box.service"
-readonly GITHUB_SINGBOX_RC_URL="https://raw.githubusercontent.com/livingfree2023/nokey/refs/heads/main/sing-box.rc"
 readonly SINGBOX_SERVICE_NAME="sing-box.service"
 readonly SINGBOX_SERVICE_NAME_ALPINE="sing-box"
 readonly SINGBOX_CONFIG_DIR="/etc/sing-box"
@@ -354,42 +352,147 @@ EOF
 }
 
 install_singbox_binary() {
-    task_start "开始，安装SING-BOX / Install SING-BOX"
+    task_start "下载并安装 SING-BOX / Download and install SING-BOX"
 
-    if [ "$ID" = "alpine" ] || [ "$ID_LIKE" = "alpine" ]; then
+    local is_alpine=0
+    if [ "${ID:-}" = "alpine" ] || [[ " ${ID_LIKE:-} " == *" alpine "* ]]; then
+        is_alpine=1
+    fi
+
+    if [[ $is_alpine -eq 1 ]]; then
         rc-service "$SINGBOX_SERVICE_NAME_ALPINE" stop 2>/dev/null || true
     else
         systemctl stop "$SINGBOX_SERVICE_NAME" 2>/dev/null || true
     fi
 
     local arch_binary_name=""
-    local arch_name=""
-    arch_binary_name="$(resolve_singbox_arch_name)" || { task_fail; error "不支持的架构: $(uname -m)，仅支持amd64和arm64 / Unsupported architecture: $(uname -m). Only amd64 and arm64 are supported."; exit 1; }
-    arch_name="$(resolve_arch_name)" || { task_fail; error "不支持的架构: $(uname -m)，仅支持amd64和arm64 / Unsupported architecture: $(uname -m). Only amd64 and arm64 are supported."; exit 1; }
+    arch_binary_name="$(resolve_singbox_arch_name)" || {
+        task_fail
+        error "不支持的CPU架构: $(uname -m)，仅支持 amd64/arm64"
+        exit 1
+    }
 
-    log_info "检测到系统 / Detected OS: $(resolve_os_family) | 架构 / Architecture: ${arch_name}"
+    mkdir -p /usr/local/bin "$SINGBOX_CONFIG_DIR" || {
+        task_fail
+        error "创建安装目录失败"
+        exit 1
+    }
 
-    mkdir -p /usr/local/bin "$SINGBOX_CONFIG_DIR" || { task_fail; error "创建sing-box目录失败 / Failed to create sing-box directories"; exit 1; }
+    # Release 中提供的是可执行二进制文件，不是压缩包。
+    # 旧脚本依赖的 sing-box.service / sing-box.rc Raw 文件已不可靠，
+    # 因此在本机生成服务定义，不再从 Raw 下载。
+    local download_tmp
+    download_tmp="$(mktemp /tmp/sing-box.download.XXXXXX)" || {
+        task_fail
+        error "无法创建下载临时文件"
+        exit 1
+    }
 
-    curl -fSL --retry 3 --retry-delay 5 "${GITHUB_RELEASE_BASE_URL}/${arch_binary_name}" -o /usr/local/bin/sing-box >> "$LOG_FILE" 2>&1 || { task_fail; error "下载${arch_binary_name}失败 / Failed to download ${arch_binary_name}"; exit 1; }
-    chmod 755 /usr/local/bin/sing-box
+    local binary_url="${GITHUB_RELEASE_BASE_URL}/${arch_binary_name}"
+    log_info "下载地址: ${binary_url}"
 
-    local svc_rc_tmp
-    local svc_service_tmp
-    svc_rc_tmp="$(mktemp /tmp/nokey.sing-box.rc.XXXXXX)" || { task_fail; error "创建sing-box.rc临时文件失败 / Failed to create temporary file for sing-box.rc"; exit 1; }
-    svc_service_tmp="$(mktemp /tmp/nokey.sing-box.service.XXXXXX)" || { task_fail; error "创建sing-box.service临时文件失败 / Failed to create temporary file for sing-box.service"; exit 1; }
+    if ! curl -fL --show-error \
+        --connect-timeout 15 --max-time 300 \
+        --retry 4 --retry-delay 3 \
+        "$binary_url" -o "$download_tmp" >> "$LOG_FILE" 2>&1; then
+        rm -f "$download_tmp"
+        task_fail
+        error "下载 ${arch_binary_name} 失败。请检查 ${LOG_FILE} 中的 HTTP 状态码、DNS 或 GitHub 网络连接。"
+        exit 1
+    fi
 
-    if [ "$ID" = "alpine" ] || [ "$ID_LIKE" = "alpine" ]; then
-        curl -fSL "${GITHUB_SINGBOX_RC_URL}" -o "${svc_rc_tmp}" >> "$LOG_FILE" 2>&1 || { task_fail; error "下载sing-box.rc失败 / Failed to download sing-box.rc"; exit 1; }
-        install -m 755 "${svc_rc_tmp}" /etc/init.d/"$SINGBOX_SERVICE_NAME_ALPINE" >> "$LOG_FILE" 2>&1 || { task_fail; error "安装/etc/init.d/$SINGBOX_SERVICE_NAME_ALPINE失败 / Failed to install /etc/init.d/$SINGBOX_SERVICE_NAME_ALPINE"; exit 1; }
-        rm -f "${svc_rc_tmp}" >> "$LOG_FILE" 2>&1
-        rc-update add "$SINGBOX_SERVICE_NAME_ALPINE" >> "$LOG_FILE" 2>&1 || { task_fail; error "启用OpenRC服务$SINGBOX_SERVICE_NAME_ALPINE失败 / Failed to enable OpenRC service $SINGBOX_SERVICE_NAME_ALPINE"; exit 1; }
+    # 检查是否为 ELF 可执行文件，防止把 404 HTML 页面当成程序安装。
+    local elf_magic
+    elf_magic="$(od -An -tx1 -N4 "$download_tmp" 2>/dev/null | tr -d ' 
+')"
+    if [[ "$elf_magic" != "7f454c46" ]]; then
+        rm -f "$download_tmp"
+        task_fail
+        error "下载文件不是 Linux ELF 可执行文件，可能是错误页面或仓库 Release 资产格式已变化。"
+        exit 1
+    fi
+
+    chmod 755 "$download_tmp"
+    if ! "$download_tmp" version >> "$LOG_FILE" 2>&1; then
+        rm -f "$download_tmp"
+        task_fail
+        error "Sing-box 二进制文件无法运行，可能是架构不匹配或文件损坏。"
+        exit 1
+    fi
+
+    if ! install -m 755 "$download_tmp" /usr/local/bin/sing-box >> "$LOG_FILE" 2>&1; then
+        rm -f "$download_tmp"
+        task_fail
+        error "安装 Sing-box 二进制文件失败"
+        exit 1
+    fi
+    rm -f "$download_tmp"
+
+    if [[ $is_alpine -eq 1 ]]; then
+        if ! command -v rc-service >/dev/null 2>&1 || ! command -v rc-update >/dev/null 2>&1; then
+            task_fail
+            error "检测到 Alpine，但缺少 OpenRC 管理命令"
+            exit 1
+        fi
+
+        cat > /etc/init.d/"$SINGBOX_SERVICE_NAME_ALPINE" <<'EOF'
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box service"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/"$SINGBOX_SERVICE_NAME_ALPINE"
+        rc-update add "$SINGBOX_SERVICE_NAME_ALPINE" default >> "$LOG_FILE" 2>&1 || {
+            task_fail
+            error "启用 Alpine OpenRC 服务失败"
+            exit 1
+        }
     else
-        curl -fSL "${GITHUB_SINGBOX_SERVICE_URL}" -o "${svc_service_tmp}" >> "$LOG_FILE" 2>&1 || { task_fail; error "下载sing-box.service失败 / Failed to download sing-box.service"; exit 1; }
-        cp "${svc_service_tmp}" /etc/systemd/system/"$SINGBOX_SERVICE_NAME" || { task_fail; error "写入/etc/systemd/system/$SINGBOX_SERVICE_NAME失败 / Failed to write /etc/systemd/system/$SINGBOX_SERVICE_NAME"; exit 1; }
-        rm -f "${svc_service_tmp}" >> "$LOG_FILE" 2>&1
-        systemctl daemon-reload >> "$LOG_FILE" 2>&1 || { task_fail; error "systemctl daemon-reload失败 / systemctl daemon-reload failed"; exit 1; }
-        systemctl enable "$SINGBOX_SERVICE_NAME" >> "$LOG_FILE" 2>&1 || { task_fail; error "启用systemd服务$SINGBOX_SERVICE_NAME失败 / Failed to enable systemd service $SINGBOX_SERVICE_NAME"; exit 1; }
+        if ! command -v systemctl >/dev/null 2>&1; then
+            task_fail
+            error "当前系统不是受支持的 systemd 系统"
+            exit 1
+        fi
+
+        cat > /etc/systemd/system/"$SINGBOX_SERVICE_NAME" <<'EOF'
+[Unit]
+Description=sing-box service
+Documentation=https://github.com/SagerNet/sing-box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/sing-box
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >> "$LOG_FILE" 2>&1 || {
+            task_fail
+            error "systemd daemon-reload 失败"
+            exit 1
+        }
+        systemctl enable "$SINGBOX_SERVICE_NAME" >> "$LOG_FILE" 2>&1 || {
+            task_fail
+            error "启用 sing-box.service 失败"
+            exit 1
+        }
     fi
 
     task_done
