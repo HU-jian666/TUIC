@@ -2,7 +2,7 @@
 
 # Constants and Configuration
 
-readonly SCRIPT_VERSION="2026.21"
+readonly SCRIPT_VERSION="2026.22"
 readonly LOG_FILE="nokey.log"
 readonly URL_FILE="nokey.url"
 readonly DEFAULT_DOMAIN="www.bing.com"
@@ -39,31 +39,31 @@ init_output_files() {
 
 # Helper functions
 error() {
-    echo -e "\n${red}$1${none}\n" | tee -a "$LOG_FILE"
+    echo -e "\n${red}$1${none}\n" \vert{} tee -a "$LOG_FILE"
 }
 
 warn() {
-    echo -e "\n${yellow}$1${none}\n" | tee -a "$LOG_FILE"
+    echo -e "\n${yellow}$1${none}\n" \vert{} tee -a "$LOG_FILE"
 }
 
 info() {
-    echo -e "${yellow}$1${none}" | tee -a "$LOG_FILE"
+    echo -e "${yellow}$1${none}" \vert{} tee -a "$LOG_FILE"
 }
 
 task_start() {
-    echo -n -e "${yellow}$1 ... ${none}" | tee -a "$LOG_FILE"
+    echo -n -e "${yellow}$1 ... ${none}" \vert{} tee -a "$LOG_FILE"
 }
 
 task_done() {
-    echo -e "[${green}OK${none}]" | tee -a "$LOG_FILE"
+    echo -e "[${green}OK${none}]" \vert{} tee -a "$LOG_FILE"
 }
 
 task_done_with_info() {
-    echo -e "${cyan}$1${none} [${green}OK${none}]" | tee -a "$LOG_FILE"
+    echo -e "${cyan}$1${none} [${green}OK${none}]" \vert{} tee -a "$LOG_FILE"
 }
 
 task_fail() {
-    echo -e "[${red}FAILED${none}]" | tee -a "$LOG_FILE"
+    echo -e "[${red}FAILED${none}]" \vert{} tee -a "$LOG_FILE"
 }
 
 log_verbose() {
@@ -78,28 +78,12 @@ separator() {
     echo -e "${cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${none}"
 }
 
-resolve_singbox_arch_name() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "sing-box_amd64" ;;
-        aarch64|arm64) echo "sing-box_arm64" ;;
-        *) return 1 ;;
-    esac
-}
-
 resolve_arch_name() {
     case "$(uname -m)" in
         x86_64|amd64)  echo "amd64" ;;
         aarch64|arm64) echo "arm64" ;;
         *) return 1 ;;
     esac
-}
-
-resolve_os_family() {
-    if [ "${ID:-}" = "alpine" ] || [ "${ID_LIKE:-}" = "alpine" ]; then
-        echo "alpine"
-    else
-        echo "debian/systemd-compatible"
-    fi
 }
 
 check_root() {
@@ -127,6 +111,26 @@ generate_uuid() {
 generate_password() {
     # 16 random bytes, base64 — used as the TUIC auth password
     openssl rand -base64 16
+}
+
+# URL encode helper function for special characters in passwords (e.g., '+', '/', '=')
+urlencode() {
+    local string="${1}"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="${c}" ;;
+            * )
+                printf -v o '%%%02x' "'$c"
+                ;;
+        esac
+        encoded="${encoded}${o}"
+         done
+    echo "${encoded}"
 }
 
 install_dependencies() {
@@ -199,22 +203,15 @@ initialize_ip_from_netstack() {
     task_done_with_info "$ip"
 }
 
-# Check whether a TCP/UDP port is already listening. Requires iproute2 (ss).
-is_port_reusable() {
-    local check_port="$1"
-    ! ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${check_port}$"
-}
-
 initialize_variables() {
     initialize_ip_from_netstack
 
-    task_start "随机选择可用端口 / Select a Random Available Port"
+    task_start "随机选择可用端口 (10000-59999) / Select a Random Available Port"
 
     port=""
     for attempt in $(seq 1 200); do
         candidate=$((10000 + RANDOM % 50000))
 
-        # ss checks both TCP and UDP listeners (IPv4 and IPv6).
         if ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${candidate}$"; then
             continue
         fi
@@ -230,8 +227,6 @@ initialize_variables() {
     fi
     task_done_with_info "$port"
 
-    # TUIC doesn't camouflage against a live upstream (that's a REALITY-only
-    # trick), so the TLS cert's SNI is just a fixed, arbitrary domain name.
     domain="$DEFAULT_DOMAIN"
 }
 
@@ -260,7 +255,7 @@ generate_crypto() {
 
 build_singbox_config() {
     local config_path="${SINGBOX_CONFIG_DIR}/config.json"
-    task_start "快好了，手搓 / Configuring $config_path"
+    task_start "正在生成配置文件 / Configuring $config_path"
 
     if ! cat > "$config_path" <<EOF
 {
@@ -301,12 +296,19 @@ build_singbox_config() {
 EOF
     then
         task_fail
-        error "写入sing-box配置文件失败: $config_path / Failed to write sing-box config to $config_path."
+        error "写入sing-box配置文件失败: $config_path"
         [[ -f "$config_path" ]] && rm -f "$config_path"
         exit 1
     fi
-    task_done
 
+    # 验证 sing-box 配置文件有效性
+    if ! /usr/local/bin/sing-box check -c "$config_path" >> "$LOG_FILE" 2>&1; then
+        task_fail
+        error "生成的 sing-box 配置文件语法校验失败，请检查 $LOG_FILE"
+        exit 1
+    fi
+
+    task_done
     log_info "--- ${config_path} ---"
     cat "$config_path" >> "$LOG_FILE"
 }
@@ -315,7 +317,7 @@ install_singbox_binary() {
     task_start "从官方源安装 SING-BOX / Install SING-BOX from official source"
 
     local is_alpine=0
-    if [ "${ID:-}" = "alpine" ] || [[ "${ID_LIKE:-}" == *alpine* ]]; then
+    if [ "${ID:-}" = "alpine" ] \vert{}\vert{} [[ "${ID_LIKE:-}" == *alpine* ]]; then
         is_alpine=1
         rc-service "$SINGBOX_SERVICE_NAME_ALPINE" stop 2>/dev/null || true
     else
@@ -323,29 +325,27 @@ install_singbox_binary() {
     fi
 
     local arch_name
-    arch_name="$(resolve_arch_name)" || { task_fail; error "不支持的架构: $(uname -m)，仅支持 amd64 和 arm64"; exit 1; }
+    arch_name="$(resolve_arch_name)" \vert{}\vert{} { task_fail; error "不支持的架构: $(uname -m)，仅支持 amd64 和 arm64"; exit 1; }
 
     mkdir -p /usr/local/bin "$SINGBOX_CONFIG_DIR" || { task_fail; error "创建 sing-box 目录失败"; exit 1; }
 
-    # Read the latest stable tag from the official SagerNet GitHub API.
     local release_json tag version asset_name download_url tmp_dir
     release_json="$(curl -fsSL --retry 3 --retry-delay 3 -H 'Accept: application/vnd.github+json' "$OFFICIAL_API")" || {
         task_fail; error "无法从 sing-box 官方 GitHub API 获取版本信息"; exit 1;
     }
-    tag="$(printf '%s' "$release_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    tag="$(printf '\%s' "$release_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
     version="${tag#v}"
     if [[ -z "$version" ]]; then
         task_fail; error "无法解析官方 sing-box 版本号"; exit 1
     fi
 
-    # Alpine uses the official musl archive; other Linux distributions use glibc.
     if [[ "$is_alpine" -eq 1 ]]; then
         asset_name="sing-box-${version}-linux-${arch_name}-musl.tar.gz"
     else
         asset_name="sing-box-${version}-linux-${arch_name}.tar.gz"
     fi
     download_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset_name}"
-    log_info "官方项目: ${OFFICIAL_REPO} | 版本: ${tag} | 文件: ${asset_name}"
+    log_info "官方项目: ${OFFICIAL_REPO} | 版本: ${tag} \vert{} 文件: ${asset_name}"
 
     tmp_dir="$(mktemp -d /tmp/sing-box-install.XXXXXX)" || { task_fail; error "无法创建临时目录"; exit 1; }
     if ! curl -fSL --retry 3 --retry-delay 5 "$download_url" -o "$tmp_dir/sing-box.tar.gz" >> "$LOG_FILE" 2>&1; then
@@ -367,7 +367,6 @@ install_singbox_binary() {
     }
     rm -rf "$tmp_dir"
 
-    # Generate service definitions locally; no third-party service files are fetched.
     if [[ "$is_alpine" -eq 1 ]]; then
         cat > /etc/init.d/"$SINGBOX_SERVICE_NAME_ALPINE" <<'OPENRC_EOF'
 #!/sbin/openrc-run
@@ -406,7 +405,6 @@ SYSTEMD_EOF
         systemctl enable "$SINGBOX_SERVICE_NAME" >> "$LOG_FILE" 2>&1 || { task_fail; error "启用 systemd 服务失败"; exit 1; }
     fi
 
-    # Fail early if the downloaded official binary cannot execute on this host.
     if ! /usr/local/bin/sing-box version >> "$LOG_FILE" 2>&1; then
         task_fail; error "官方 sing-box 二进制文件无法运行，请检查系统架构/运行库"; exit 1
     fi
@@ -414,15 +412,20 @@ SYSTEMD_EOF
 }
 
 restart_singbox_service() {
-    task_start "冲刺，开启服务 / Starting Service"
-    if [ "$ID" = "alpine" ] || [ "$ID_LIKE" = "alpine" ]; then
+    task_start "启动服务 / Starting Service"
+    if [ "$ID" = "alpine" ] \vert{}\vert{} [ "$ID_LIKE" = "alpine" ]; then
         restart_cmd=(rc-service "$SINGBOX_SERVICE_NAME_ALPINE" restart)
     else
         restart_cmd=(systemctl restart "$SINGBOX_SERVICE_NAME")
     fi
     if ! "${restart_cmd[@]}" >> "$LOG_FILE" 2>&1; then
         task_fail
-        error "重启sing-box服务失败，请查看$LOG_FILE获取详情 / Failed to restart sing-box service. Check $LOG_FILE for details."
+        error "重启 sing-box 服务失败，详细日志："
+        if [ "$ID" = "alpine" ]; then
+            rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status \vert{} tee -a "$LOG_FILE"
+        else
+            systemctl status "$SINGBOX_SERVICE_NAME" --no-pager \vert{} tee -a "$LOG_FILE"
+        fi
         exit 1
     fi
     task_done
@@ -433,8 +436,6 @@ open_firewall_port() {
 
     local firewall_handled=0
 
-    # UFW: add the rule only when UFW is already active. Do not enable UFW
-    # automatically, because doing so can lock out remote SSH sessions.
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "${port}/udp" >> "$LOG_FILE" 2>&1 || {
             task_fail; error "UFW 放行 UDP ${port} 失败"; exit 1;
@@ -443,7 +444,6 @@ open_firewall_port() {
         log_info "UFW 已放行 UDP ${port}"
     fi
 
-    # firewalld: add both runtime and permanent rules when the daemon is active.
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --add-port="${port}/udp" >> "$LOG_FILE" 2>&1 || {
             task_fail; error "Firewalld 临时放行 UDP ${port} 失败"; exit 1;
@@ -455,9 +455,6 @@ open_firewall_port() {
         log_info "Firewalld 已永久放行 UDP ${port}"
     fi
 
-    # If no managed firewall is active, add a runtime iptables rule when available.
-    # This fallback is not guaranteed to survive reboot; persist it with the host's
-    # firewall manager if persistence is required.
     if [[ "$firewall_handled" -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
         if ! iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
             iptables -I INPUT -p udp --dport "$port" -j ACCEPT >> "$LOG_FILE" 2>&1 || {
@@ -469,7 +466,7 @@ open_firewall_port() {
                 ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
         fi
         firewall_handled=1
-        log_info "iptables 已添加 UDP ${port} 运行时放行规则（重启后是否保留取决于系统规则持久化配置）"
+        log_info "iptables 已添加 UDP ${port} 运行时放行规则"
     fi
 
     if [[ "$firewall_handled" -eq 0 ]]; then
@@ -480,24 +477,16 @@ open_firewall_port() {
     task_done_with_info "UDP ${port} 已添加防火墙放行规则"
 }
 
-configure_singbox() {
-    initialize_variables
-    open_firewall_port
-    generate_crypto
-    build_singbox_config
-    restart_singbox_service
-}
-
 enable_bbr() {
-    task_start "最后，打开BBR / Finishing, Enabling BBR"
+    task_start "正在启用 BBR / Enabling BBR"
 
     if [[ ! -w /etc/sysctl.conf ]]; then
-        task_done_with_info "跳过BBR：/etc/sysctl.conf不可写 / Skip BBR: /etc/sysctl.conf is not writable"
+        task_done_with_info "跳过BBR：/etc/sysctl.conf不可写"
         return
     fi
 
     if [[ ! -e /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-        task_done_with_info "跳过BBR：内核未暴露tcp_congestion_control / Skip BBR: kernel does not expose tcp_congestion_control"
+        task_done_with_info "跳过BBR：内核未暴露tcp_congestion_control"
         return
     fi
 
@@ -515,36 +504,34 @@ enable_bbr() {
     if [[ "$current_cc" == *bbr* ]]; then
         task_done
     else
-        warn "BBR未生效：当前拥塞算法为 ${current_cc:-unknown} / BBR not active: current congestion control is ${current_cc:-unknown}"
+        warn "BBR未生效：当前拥塞算法为 ${current_cc:-unknown}"
     fi
 }
 
 show_banner() {
-    echo -e "      ___         ___         ___         ___               "
-    echo -e "     /__/\\       /  /\\       /__/|       /  /\\        ___   "
-    echo -e "     \\  \\:\\     /  /::\\     |  |:|      /  /:/_      /__/|  "
-    echo -e "      \\  \\:\\   /  /:/\\:\\    |  |:|     /  /:/ /\\    |  |:|  "
-    echo -e "  _____\\__\\:\\ /  /:/  \\:\\ __|  |:|    /  /:/ /:/_   |  |:|  "
-    echo -e " /__/::::::::/__/:/ \\__\\:/__/\_|:|___/__/:/ /:/ /\\__|__|:|  "
-    echo -e " \\  \\:\\~~\\~~\\\\  \\:\\ /  /:\\  \\:\\/:::::\\  \\:\\/:/ /:/__/::::\\  "
-    echo -e "  \\  \\:\\  ~~~ \\  \\:\\  /:/ \\  \\::/~~~~ \\  \\::/ /:/   ~\\~~\\:\\ "
-    echo -e "   \\  \\:\\      \\  \\:\\/:/   \\  \\:\\      \\  \\:\\/:/      \\  \\:\\"
+    echo -e "     ___         ___         ___         ___                 "
+    echo -e "    /__/\\       /  /\\       /__/|       /  /\\       ___    "
+    echo -e "    \\  \\:\\     /  /::\\     |  |:|      /  /:/_     /__/|   "
+    echo -e "     \\  \\:\\   /  /:/\\:\\    |  |:|     /  /:/ /\\    |  |:|   "
+    echo -e " _____\\__\\:\\ /  /:/  \\:\\ __|  |:|    /  /:/ /:/_   |  |:|   "
+    echo -e " /__/::::::::/__/:/ \\__\\:/__/\\_|:|___/__/:/ /:/ /\\__|__|:|   "
+    echo -e " \\  \\:\\~~\\~~\\\\  \\:\\ /  /:\\  \\:\\/:::::\\  \\:\\/:/ /:/__/::::\\   "
+    echo -e "  \\  \\:\\  ~~~ \\  \\:\\  /:/ \\  \\::/~~~~ \\  \\::/ /:/   ~\\~~\\:\\  "
+    echo -e "   \\  \\:\\      \\  \\:\\/:/   \\  \\:\\      \\  \\:\\/:/      \\  \\:\\ "
     echo -e "    \\  \\:\\      \\  \\::/     \\  \\:\\      \\  \\::/        \\__\\/"
-    echo -e "     \\__\\/       \\__\\/       \\__\\/       \\__\\/              "
-
+    echo -e "     \\__\\/       \\__\\/       \\__\\/       \\__\\/               "
     echo "项目地址，欢迎点点点点星 / STAR ME PLEEEEEAAAASE"
     echo -e "${cyan}$GITHUB_URL${none}"
 }
 
 check_service_status() {
     task_start "检查服务状态 / Checking Service"
-    if [ "$ID" = "alpine" ] || [ "$ID_LIKE" = "alpine" ]; then
+    if [ "$ID" = "alpine" ] \vert{}\vert{} [ "$ID_LIKE" = "alpine" ]; then
         if rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status >> "$LOG_FILE" 2>&1; then
             info "Sing-box服务运行中 / Sing-box is running"
         else
             error "Sing-box服务未运行 / Sing-box service is not active"
-            rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status | tee -a "$LOG_FILE"
-            error "详细日志记录在 $LOG_FILE / See complete logs"
+            rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status \vert{} tee -a "$LOG_FILE"
             exit 1
         fi
     else
@@ -552,8 +539,7 @@ check_service_status() {
             info "Sing-box服务运行中 / Sing-box is running"
         else
             error "Sing-box服务未运行 / Sing-box service is not active"
-            systemctl status "$SINGBOX_SERVICE_NAME" | tee -a "$LOG_FILE"
-            error "详细日志记录在 $LOG_FILE / See complete logs"
+            systemctl status "$SINGBOX_SERVICE_NAME" --no-pager \vert{} tee -a "$LOG_FILE"
             exit 1
         fi
     fi
@@ -564,85 +550,44 @@ generate_share_links() {
     local link_ip="$ip"
     [[ $netstack == "6" ]] && link_ip="[$ip]"
 
-    tuic_url="tuic://${uuid}:${password}@${link_ip}:${port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${domain}&allow_insecure=1#${current_hostname}"
+    # 对密码进行 URL 编码，避免包含 '+' 或 '/' 时客户端解析失败
+    local encoded_password
+    encoded_password=$(urlencode "$password")
 
-    info "分享链接 / Share Link:"
-    echo -e "${magenta}${tuic_url}${none}" | tee -a "$LOG_FILE"
+    tuic_url="tuic://${uuid}:${encoded_password}@${link_ip}:${port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${domain}&allow_insecure=1#${current_hostname}"
+
+    info "v2rayN / Shadowrocket 分享链接:"
+    echo -e "${magenta}${tuic_url}${none}" \vert{} tee -a "$LOG_FILE"
     echo "$tuic_url" >> "$URL_FILE"
 }
 
-generate_clash_config() {
-    local server_ip_for_clash="$ip"
-    [[ $netstack == "6" ]] && server_ip_for_clash=${ip:1:-1}
-
-    clash_tuic_config=$(cat <<-EOF
-- name: ${current_hostname}
-  type: tuic
-  server: ${server_ip_for_clash}
-  port: ${port}
-  uuid: ${uuid}
-  password: ${password}
-  alpn: [h3]
-  disable-sni: false
-  reduce-rtt: true
-  udp-relay-mode: native
-  congestion-controller: bbr
-  sni: ${domain}
-  skip-cert-verify: true
-EOF
-)
-    info "Clash.meta 配置 / Clash.meta config:"
-    echo -e "${cyan}${clash_tuic_config}${none}" | tee -a "$LOG_FILE"
-    echo "$clash_tuic_config" >> "$URL_FILE"
-}
-
-# Emit an extra IPv6 share URL + clash entry when the box is dual-stack but the
-# primary netstack is IPv4.
 generate_ipv6_variants() {
     [[ $netstack == "4" && -n "${IPv6:-}" ]] || return 0
 
-    local ipv6_link
-    ipv6_link="tuic://${uuid}:${password}@[${IPv6}]:${port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${domain}&allow_insecure=1#${current_hostname}-ipv6"
-    info "分享链接 (IPv6) / Share Link (IPv6):"
-    echo -e "${magenta}${ipv6_link}${none}" | tee -a "$LOG_FILE"
-    echo "$ipv6_link" >> "$URL_FILE"
+    local encoded_password
+    encoded_password=$(urlencode "$password")
 
-    local ipv6_clash
-    ipv6_clash=$(cat <<-EOF
-- name: ${current_hostname}-ipv6
-  type: tuic
-  server: ${IPv6}
-  port: ${port}
-  uuid: ${uuid}
-  password: ${password}
-  alpn: [h3]
-  disable-sni: false
-  reduce-rtt: true
-  udp-relay-mode: native
-  congestion-controller: bbr
-  sni: ${domain}
-  skip-cert-verify: true
-EOF
-)
-    info "Clash.meta 配置 (IPv6) / Clash.meta config (IPv6):"
-    echo -e "${cyan}${ipv6_clash}${none}" | tee -a "$LOG_FILE"
-    echo "$ipv6_clash" >> "$URL_FILE"
+    local ipv6_link
+    ipv6_link="tuic://${uuid}:${encoded_password}@[${IPv6}]:${port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${domain}&allow_insecure=1#${current_hostname}-ipv6"
+    
+    info "分享链接 (IPv6):"
+    echo -e "${magenta}${ipv6_link}${none}" \vert{} tee -a "$LOG_FILE"
+    echo "$ipv6_link" >> "$URL_FILE"
 }
 
 output_results() {
     check_service_status
 
-    echo -e "${green}舒服了 / Done:${none}" | tee -a "$LOG_FILE"
+    echo -e "${green}部署完成 / Done:${none}" \vert{} tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
     separator | tee -a "$LOG_FILE"
-    echo -e "  ${green}✓${none} Sing-box TUIC" | tee -a "$LOG_FILE"
-    echo -e "  ${cyan}IP:Port${none} → ${ip}:${port}" | tee -a "$LOG_FILE"
-    echo -e "  ${cyan}UUID${none} → ${uuid}" | tee -a "$LOG_FILE"
+    echo -e "  ${green}✓${none} Sing-box TUIC (v2rayN 7.25.6+ & Shadowrocket)" | tee -a "$LOG_FILE"
+    echo -e "  ${cyan}IP:Port${none} →${ip}:${port}" \vert{} tee -a "$LOG_FILE"
+    echo -e "  ${cyan}UUID${none}    → ${uuid}" \vert{} tee -a "$LOG_FILE"
     separator | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
 
     generate_share_links
-    generate_clash_config
     generate_ipv6_variants
 }
 
@@ -660,7 +605,7 @@ main() {
 
     show_banner
     init_output_files
-    echo -e "当前版本 / Version: ${cyan}${SCRIPT_VERSION}${none} " | tee -a "$LOG_FILE"
+    echo -e "当前版本 / Version: ${cyan}${SCRIPT_VERSION}${none} " \vert{} tee -a "$LOG_FILE"
 
     check_root
     install_dependencies
@@ -672,7 +617,7 @@ main() {
 
     output_results
     info "总用时 / Elapsed Time:  ${green}$SECONDS 秒${none}"
-    echo -e "---------- ${cyan}live free or die hard${none} -------------" | tee -a "$LOG_FILE"
+    echo -e "---------- ${cyan}live free or die hard${none} -------------" \vert{} tee -a "$LOG_FILE"
 }
 
 main "$@"
