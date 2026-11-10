@@ -2,7 +2,7 @@
 
 # Constants and Configuration
 
-readonly SCRIPT_VERSION="2026.22"
+readonly SCRIPT_VERSION="2026.23"
 readonly LOG_FILE="nokey.log"
 readonly URL_FILE="nokey.url"
 readonly DEFAULT_DOMAIN="www.bing.com"
@@ -79,10 +79,19 @@ separator() {
 }
 
 resolve_arch_name() {
-    case "$(uname -m)" in
-        x86_64|amd64)  echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *) return 1 ;;
+    local m
+    m="$(uname -m)"
+    case "$m" in
+        x86_64|amd64|x64) echo "amd64" ;;
+        aarch64|arm64)    echo "arm64" ;;
+        *) 
+            # 兼容其他常见的输出格式
+            if echo "$m" | grep -Eqi "arm|aarch"; then
+                echo "arm64"
+            else
+                echo "amd64"
+            fi
+            ;;
     esac
 }
 
@@ -109,11 +118,9 @@ generate_uuid() {
 }
 
 generate_password() {
-    # 16 random bytes, base64 — used as the TUIC auth password
     openssl rand -base64 16
 }
 
-# URL encode helper function for special characters in passwords (e.g., '+', '/', '=')
 urlencode() {
     local string="${1}"
     local strlen=${#string}
@@ -129,7 +136,7 @@ urlencode() {
                 ;;
         esac
         encoded="${encoded}${o}"
-         done
+    done
     echo "${encoded}"
 }
 
@@ -171,7 +178,7 @@ install_dependencies() {
             eval "$install_cmd" "$package_name" >> "$LOG_FILE" 2>&1
             if ! command -v "$tool" > /dev/null 2>&1; then
                 task_fail
-                error "安装$tool失败，请手动安装后重新运行脚本 / Failed to install '$tool'. Please install it manually and re-run the script."
+                error "安装$tool失败，请手动安装后重新运行脚本 / Failed to install '$tool'."
                 exit 1
             fi
         fi
@@ -301,7 +308,6 @@ EOF
         exit 1
     fi
 
-    # 验证 sing-box 配置文件有效性
     if ! /usr/local/bin/sing-box check -c "$config_path" >> "$LOG_FILE" 2>&1; then
         task_fail
         error "生成的 sing-box 配置文件语法校验失败，请检查 $LOG_FILE"
@@ -325,7 +331,7 @@ install_singbox_binary() {
     fi
 
     local arch_name
-    arch_name="$(resolve_arch_name)" \vert{}\vert{} { task_fail; error "不支持的架构: $(uname -m)，仅支持 amd64 和 arm64"; exit 1; }
+    arch_name="$(resolve_arch_name)" \vert{}\vert{} { task_fail; error "不支持的架构: $(uname -m)"; exit 1; }
 
     mkdir -p /usr/local/bin "$SINGBOX_CONFIG_DIR" || { task_fail; error "创建 sing-box 目录失败"; exit 1; }
 
@@ -406,7 +412,7 @@ SYSTEMD_EOF
     fi
 
     if ! /usr/local/bin/sing-box version >> "$LOG_FILE" 2>&1; then
-        task_fail; error "官方 sing-box 二进制文件无法运行，请检查系统架构/运行库"; exit 1
+        task_fail; error "官方 sing-box 二进制文件无法运行，请检查系统架构"; exit 1
     fi
     task_done_with_info "官方 sing-box ${tag} 已安装"
 }
@@ -441,7 +447,6 @@ open_firewall_port() {
             task_fail; error "UFW 放行 UDP ${port} 失败"; exit 1;
         }
         firewall_handled=1
-        log_info "UFW 已放行 UDP ${port}"
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -452,7 +457,6 @@ open_firewall_port() {
             task_fail; error "Firewalld 永久放行 UDP ${port} 失败"; exit 1;
         }
         firewall_handled=1
-        log_info "Firewalld 已永久放行 UDP ${port}"
     fi
 
     if [[ "$firewall_handled" -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
@@ -466,27 +470,21 @@ open_firewall_port() {
                 ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
         fi
         firewall_handled=1
-        log_info "iptables 已添加 UDP ${port} 运行时放行规则"
     fi
 
     if [[ "$firewall_handled" -eq 0 ]]; then
-        task_done_with_info "未检测到正在运行的受支持防火墙，跳过系统防火墙修改"
+        task_done_with_info "未检测到正在运行的受支持防火墙，跳过"
         return 0
     fi
 
-    task_done_with_info "UDP ${port} 已添加防火墙放行规则"
+    task_done_with_info "UDP ${port} 防火墙放行成功"
 }
 
 enable_bbr() {
     task_start "正在启用 BBR / Enabling BBR"
 
-    if [[ ! -w /etc/sysctl.conf ]]; then
-        task_done_with_info "跳过BBR：/etc/sysctl.conf不可写"
-        return
-    fi
-
-    if [[ ! -e /proc/sys/net/ipv4/tcp_congestion_control ]]; then
-        task_done_with_info "跳过BBR：内核未暴露tcp_congestion_control"
+    if [[ ! -w /etc/sysctl.conf ]] || [[ ! -e /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+        task_done_with_info "跳过 BBR"
         return
     fi
 
@@ -499,13 +497,7 @@ enable_bbr() {
     fi
 
     sysctl -p >> "$LOG_FILE" 2>&1 || true
-    local current_cc=""
-    current_cc="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)"
-    if [[ "$current_cc" == *bbr* ]]; then
-        task_done
-    else
-        warn "BBR未生效：当前拥塞算法为 ${current_cc:-unknown}"
-    fi
+    task_done
 }
 
 show_banner() {
@@ -520,28 +512,16 @@ show_banner() {
     echo -e "   \\  \\:\\      \\  \\:\\/:/   \\  \\:\\      \\  \\:\\/:/      \\  \\:\\ "
     echo -e "    \\  \\:\\      \\  \\::/     \\  \\:\\      \\  \\::/        \\__\\/"
     echo -e "     \\__\\/       \\__\\/       \\__\\/       \\__\\/               "
-    echo "项目地址，欢迎点点点点星 / STAR ME PLEEEEEAAAASE"
+    echo "项目地址 / GitHub"
     echo -e "${cyan}$GITHUB_URL${none}"
 }
 
 check_service_status() {
     task_start "检查服务状态 / Checking Service"
     if [ "$ID" = "alpine" ] \vert{}\vert{} [ "$ID_LIKE" = "alpine" ]; then
-        if rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status >> "$LOG_FILE" 2>&1; then
-            info "Sing-box服务运行中 / Sing-box is running"
-        else
-            error "Sing-box服务未运行 / Sing-box service is not active"
-            rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status \vert{} tee -a "$LOG_FILE"
-            exit 1
-        fi
+        rc-service "$SINGBOX_SERVICE_NAME_ALPINE" status >> "$LOG_FILE" 2>&1 || { error "服务未运行"; exit 1; }
     else
-        if systemctl is-active --quiet "$SINGBOX_SERVICE_NAME"; then
-            info "Sing-box服务运行中 / Sing-box is running"
-        else
-            error "Sing-box服务未运行 / Sing-box service is not active"
-            systemctl status "$SINGBOX_SERVICE_NAME" --no-pager \vert{} tee -a "$LOG_FILE"
-            exit 1
-        fi
+        systemctl is-active --quiet "$SINGBOX_SERVICE_NAME" || { error "服务未运行"; systemctl status "$SINGBOX_SERVICE_NAME" --no-pager \vert{} tee -a "$LOG_FILE"; exit 1; }
     fi
     task_done
 }
@@ -550,7 +530,6 @@ generate_share_links() {
     local link_ip="$ip"
     [[ $netstack == "6" ]] && link_ip="[$ip]"
 
-    # 对密码进行 URL 编码，避免包含 '+' 或 '/' 时客户端解析失败
     local encoded_password
     encoded_password=$(urlencode "$password")
 
@@ -591,12 +570,10 @@ output_results() {
     generate_ipv6_variants
 }
 
-# Main function
 main() {
     SECONDS=0
 
     if [ -f /etc/os-release ]; then
-        # shellcheck disable=SC1091
         . /etc/os-release
     else
         error "无法识别的OS / Cannot determine OS."
