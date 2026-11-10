@@ -1,4 +1,4 @@
- #!/bin/bash
+#!/bin/bash
 
 # Constants and Configuration
 
@@ -250,35 +250,24 @@ is_port_reusable() {
 initialize_variables() {
     initialize_ip_from_netstack
 
-    task_start "随机选择可用端口 / Select a Random Available Port"
-
-    port=""
-    for attempt in $(seq 1 200); do
-        candidate=$((20000 + RANDOM % 40000))
-
-        # Check both TCP and UDP listeners to avoid port conflicts.
-        if command -v ss >/dev/null 2>&1; then
-            if ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${candidate}$"; then
-                continue
+    task_start "寻找一个合适的端口 / Find an Available Port"
+    if is_port_reusable 443 sing-box "$SINGBOX_SERVICE_NAME" "$SINGBOX_SERVICE_NAME_ALPINE"; then
+        port=443
+    else
+        base=$((10000 + RANDOM % 50000))
+        port_found=0
+        for i in $(seq 0 1000); do
+            port=$((base + i))
+            if ! (echo > /dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1; then
+                port_found=1
+                break
             fi
-        elif command -v netstat >/dev/null 2>&1; then
-            if netstat -lntu 2>/dev/null | awk 'NR>2 {print $4}' | grep -Eq "[:.]${candidate}$"; then
-                continue
-            fi
-        else
-            if (echo > /dev/tcp/127.0.0.1/"$candidate") >/dev/null 2>&1; then
-                continue
-            fi
+        done
+        if [[ $port_found -eq 0 ]]; then
+            task_fail
+            error "没有找到可用端口 / Could not find an unused port."
+            exit 1
         fi
-
-        port="$candidate"
-        break
-    done
-
-    if [[ -z "$port" ]]; then
-        task_fail
-        error "无法找到随机可用端口 / Could not find a random available port."
-        exit 1
     fi
     task_done_with_info "$port"
 
