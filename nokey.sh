@@ -2,7 +2,7 @@
 
 # Constants and Configuration
 
-readonly SCRIPT_VERSION="2026.20"
+readonly SCRIPT_VERSION="2026.21"
 readonly LOG_FILE="nokey.log"
 readonly URL_FILE="nokey.url"
 readonly DEFAULT_DOMAIN="www.bing.com"
@@ -132,7 +132,7 @@ generate_password() {
 install_dependencies() {
     task_start "工具链检查 / Tool check"
 
-    local tools=("curl" "netstat" "openssl")
+    local tools=("curl" "ss" "openssl")
 
     declare -A os_package_command=(
         [apt]="apt install -y"
@@ -163,7 +163,7 @@ install_dependencies() {
     for tool in "${tools[@]}"; do
         if ! command -v "$tool" > /dev/null 2>&1; then
             local package_name="$tool"
-            [[ "$tool" == "netstat" ]] && package_name="net-tools"
+            [[ "$tool" == "ss" ]] && package_name="iproute2"
             eval "$install_cmd" "$package_name" >> "$LOG_FILE" 2>&1
             if ! command -v "$tool" > /dev/null 2>&1; then
                 task_fail
@@ -199,75 +199,34 @@ initialize_ip_from_netstack() {
     task_done_with_info "$ip"
 }
 
-# Returns 0 if <port> is free or already owned by our service.
+# Check whether a TCP/UDP port is already listening. Requires iproute2 (ss).
 is_port_reusable() {
     local check_port="$1"
-    local process_name="$2"
-    local systemd_service="$3"
-    local openrc_service="$4"
-    local port_in_use=0
-
-    if command -v ss >/dev/null 2>&1; then
-        if ss -ltn "sport = :$check_port" 2>/dev/null | grep -q .; then
-            port_in_use=1
-        fi
-    elif command -v netstat >/dev/null 2>&1; then
-        if netstat -ltn 2>/dev/null | grep -qE "[:]$check_port($| )"; then
-            port_in_use=1
-        fi
-    else
-        if (echo > /dev/tcp/127.0.0.1/"$check_port") >/dev/null 2>&1; then
-            port_in_use=1
-        fi
-    fi
-
-    if [[ $port_in_use -eq 0 ]]; then
-        return 0
-    fi
-
-    if command -v ss >/dev/null 2>&1; then
-        if ss -ltnp "sport = :$check_port" 2>/dev/null | grep -q "$process_name"; then
-            return 0
-        fi
-    elif command -v netstat >/dev/null 2>&1; then
-        if netstat -ltnp 2>/dev/null | grep -E "[:.]$check_port($| )" | grep -q "$process_name"; then
-            return 0
-        fi
-    else
-        if [ "$ID" = "alpine" ] || [ "$ID_LIKE" = "alpine" ]; then
-            if rc-service "$openrc_service" status >/dev/null 2>&1; then
-                return 0
-            fi
-        else
-            if systemctl is-active --quiet "$systemd_service"; then
-                return 0
-            fi
-        fi
-    fi
-    return 1
+    ! ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${check_port}$"
 }
 
 initialize_variables() {
     initialize_ip_from_netstack
 
-    task_start "寻找一个合适的端口 / Find an Available Port"
-    if is_port_reusable 443 sing-box "$SINGBOX_SERVICE_NAME" "$SINGBOX_SERVICE_NAME_ALPINE"; then
-        port=443
-    else
-        base=$((10000 + RANDOM % 50000))
-        port_found=0
-        for i in $(seq 0 1000); do
-            port=$((base + i))
-            if ! (echo > /dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1; then
-                port_found=1
-                break
-            fi
-        done
-        if [[ $port_found -eq 0 ]]; then
-            task_fail
-            error "没有找到可用端口 / Could not find an unused port."
-            exit 1
+    task_start "随机选择可用端口 / Select a Random Available Port"
+
+    port=""
+    for attempt in $(seq 1 200); do
+        candidate=$((10000 + RANDOM % 50000))
+
+        # ss checks both TCP and UDP listeners (IPv4 and IPv6).
+        if ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${candidate}$"; then
+            continue
         fi
+
+        port="$candidate"
+        break
+    done
+
+    if [[ -z "$port" ]]; then
+        task_fail
+        error "无法找到随机可用端口 / Could not find a random available port."
+        exit 1
     fi
     task_done_with_info "$port"
 
@@ -469,8 +428,61 @@ restart_singbox_service() {
     task_done
 }
 
+open_firewall_port() {
+    task_start "自动放行 UDP 端口 / Opening UDP firewall port"
+
+    local firewall_handled=0
+
+    # UFW: add the rule only when UFW is already active. Do not enable UFW
+    # automatically, because doing so can lock out remote SSH sessions.
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${port}/udp" >> "$LOG_FILE" 2>&1 || {
+            task_fail; error "UFW 放行 UDP ${port} 失败"; exit 1;
+        }
+        firewall_handled=1
+        log_info "UFW 已放行 UDP ${port}"
+    fi
+
+    # firewalld: add both runtime and permanent rules when the daemon is active.
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --add-port="${port}/udp" >> "$LOG_FILE" 2>&1 || {
+            task_fail; error "Firewalld 临时放行 UDP ${port} 失败"; exit 1;
+        }
+        firewall-cmd --permanent --add-port="${port}/udp" >> "$LOG_FILE" 2>&1 || {
+            task_fail; error "Firewalld 永久放行 UDP ${port} 失败"; exit 1;
+        }
+        firewall_handled=1
+        log_info "Firewalld 已永久放行 UDP ${port}"
+    fi
+
+    # If no managed firewall is active, add a runtime iptables rule when available.
+    # This fallback is not guaranteed to survive reboot; persist it with the host's
+    # firewall manager if persistence is required.
+    if [[ "$firewall_handled" -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
+        if ! iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p udp --dport "$port" -j ACCEPT >> "$LOG_FILE" 2>&1 || {
+                task_fail; error "iptables 放行 UDP ${port} 失败"; exit 1;
+            }
+        fi
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
+                ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        firewall_handled=1
+        log_info "iptables 已添加 UDP ${port} 运行时放行规则（重启后是否保留取决于系统规则持久化配置）"
+    fi
+
+    if [[ "$firewall_handled" -eq 0 ]]; then
+        task_done_with_info "未检测到正在运行的受支持防火墙，跳过系统防火墙修改"
+        return 0
+    fi
+
+    task_done_with_info "UDP ${port} 已添加防火墙放行规则"
+}
+
 configure_singbox() {
     initialize_variables
+    open_firewall_port
     generate_crypto
     build_singbox_config
     restart_singbox_service
